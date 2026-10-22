@@ -16,6 +16,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/redux.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/utf8.h"
 #include "xenia/config.h"
@@ -436,6 +437,12 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+
+  const uint64_t vblank =
+      redux::vblank_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (redux::vblank_hook) {
+    redux::vblank_hook(vblank);
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

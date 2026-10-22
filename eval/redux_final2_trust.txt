@@ -1,0 +1,7 @@
+82338a88 trusted
+82807828 trusted
+82817e08 not-trusted  # fma x8, fctiw x3, host FMA on: fused
+8281dd38 not-trusted  # fma x2, stfs x3, host FMA on: fused
+8296fea8 not-trusted  # estimate x2, fma x6, host FMA on: fused
+829a6838 not-trusted  # estimate x6, fma x24, stfs x14, host FMA on: fused
+82c45138 trusted

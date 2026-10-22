@@ -69,9 +69,9 @@ X_RESULT xeXamDispatchDialog(T* dialog,
       result = close_callback(dialog);
     });
     xe::threading::Fence fence;
-    xe::ui::WindowedAppContext& app_context =
-        kernel_state()->emulator()->display_window()->app_context();
-    if (app_context.CallInUIThreadSynchronous(
+    auto display_window = kernel_state()->emulator()->display_window();
+    if (display_window &&
+        display_window->app_context().CallInUIThreadSynchronous(
             [&dialog, &fence]() { dialog->Then(&fence); })) {
       fence.Wait();
       kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
@@ -115,7 +115,8 @@ X_RESULT xeXamDispatchDialogEx(
           result = close_callback(dialog, extended_error, length);
         });
     xe::threading::Fence fence;
-    if (display_window->app_context().CallInUIThreadSynchronous(
+    if (display_window &&
+        display_window->app_context().CallInUIThreadSynchronous(
             [&dialog, &fence]() { dialog->Then(&fence); })) {
       fence.Wait();
       kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
@@ -220,6 +221,16 @@ X_RESULT xeXamDispatchHeadlessAsync(std::function<void()> run_callback) {
   kernel_state()->BroadcastNotification(kXNotificationSystemUI, true);
 
   auto display_window = kernel_state()->emulator()->display_window();
+  if (!display_window) {
+    // No-window launch: nothing to draw on, so run it on a host thread.
+    std::thread([run_callback]() {
+      run_callback();
+      kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+      xe::threading::Sleep(kUIDelayMillis);
+      kernel_state()->BroadcastNotification(kXNotificationSystemUI, false);
+    }).detach();
+    return X_ERROR_SUCCESS;
+  }
   display_window->app_context().CallInUIThread([run_callback]() {
     run_callback();
 
@@ -472,8 +483,10 @@ dword_result_t XNotifyQueueUI_entry(dword_t exnq, dword_t dwUserIndex,
   const Emulator* emulator = kernel_state()->emulator();
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
 
-  new xe::ui::XNotifyWindow(imgui_drawer, "", displayText, dwUserIndex,
-                            position_id);
+  if (imgui_drawer) {
+    new xe::ui::XNotifyWindow(imgui_drawer, "", displayText, dwUserIndex,
+                              position_id);
+  }
 
   // XNotifyQueueUI -> XNotifyQueueUIEx -> XMsgProcessRequest ->
   // XMsgStartIORequestEx & XMsgInProcessCall

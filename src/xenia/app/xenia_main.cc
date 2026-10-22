@@ -8,12 +8,16 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 
+#include "third_party/stb/stb_image_write.h"
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/assert.h"
@@ -22,12 +26,16 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/redux.h"
+#include "xenia/base/utf8.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
 #include "xenia/debug/ui/debug_window.h"
 #include "xenia/emulator.h"
+#include "xenia/gpu/graphics_system.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/ui/file_picker.h"
+#include "xenia/ui/presenter.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app.h"
@@ -60,6 +68,7 @@
 #include "xenia/hid/keyboard/keyboard_hid.h"
 #endif  // XE_PLATFORM_LINUX
 #include "xenia/hid/nop/nop_hid.h"
+#include "xenia/hid/nop/replay_input_driver.h"
 #if !XE_PLATFORM_ANDROID
 #include "xenia/hid/sdl/sdl_hid.h"
 #endif  // !XE_PLATFORM_ANDROID
@@ -85,6 +94,27 @@
 DEFINE_string(apu, "any", "Audio system. Use: " APU_OPTIONS, "APU");
 DEFINE_string(gpu, "any", "Graphics system. Use: " GPU_OPTIONS, "GPU");
 DEFINE_string(hid, "any", "Input system. Use: " HID_OPTIONS, "HID");
+
+// XeniaRedux recorder options.
+DEFINE_string(replay_input, "",
+              "XeniaRedux: play a scripted button list on controller 0 instead "
+              "of real input, keyed by vblank (DecompPipeline --input syntax, "
+              "e.g. START@900,A@1500+10, or @file).",
+              "HID");
+DEFINE_transient_bool(no_window, false,
+                      "XeniaRedux: run without a window or presenter "
+                      "(implies --headless).",
+                      "General");
+DEFINE_string(snapshot_vblanks, "",
+              "XeniaRedux: comma-separated vblank numbers at which to save the "
+              "guest output as PNG to --snapshot_dir.",
+              "General");
+DEFINE_path(snapshot_dir, "snapshots", "XeniaRedux: folder for snapshots.",
+            "General");
+DEFINE_uint64(exit_after_vblanks, 0,
+              "XeniaRedux: flush the logs and exit at this vblank (0 = never).",
+              "General");
+DECLARE_bool(headless);
 
 DEFINE_path(
     storage_root, "",
@@ -281,6 +311,9 @@ class EmulatorApp final : public xe::ui::WindowedApp {
 
   void EmulatorThread();
   void ShutdownEmulatorThreadFromUIThread();
+  // XeniaRedux: snapshots and the timed exit, run at guest vblanks.
+  void SetupReduxVblankHook();
+  void SaveSnapshot(uint64_t vblank);
 
   DebugWindowClosedListener debug_window_closed_listener_;
 
@@ -446,7 +479,17 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
 std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
     ui::Window* window) {
   std::vector<std::unique_ptr<hid::InputDriver>> drivers;
-  if (cvars::hid.compare("nop") == 0) {
+  if (!cvars::replay_input.empty()) {
+    // Scripted input only, so a run does not depend on what is plugged in.
+    auto driver = xe::hid::nop::CreateReplay(
+        window, EmulatorWindow::kZOrderHidInput, cvars::replay_input);
+    if (!driver || XFAILED(driver->Setup())) {
+      XELOGE("--replay_input could not be used; exiting");
+      xe::FlushLog();
+      std::quick_exit(EXIT_FAILURE);
+    }
+    drivers.emplace_back(std::move(driver));
+  } else if (cvars::hid.compare("nop") == 0 || cvars::no_window) {
     drivers.emplace_back(
         xe::hid::nop::Create(window, EmulatorWindow::kZOrderHidInput));
   } else {
@@ -546,10 +589,14 @@ bool EmulatorApp::OnInitialize() {
       std::make_unique<Emulator>("", storage_root, content_root, cache_root);
 
   // Main emulator display window.
-  emulator_window_ =
-      EmulatorWindow::Create(emulator_.get(), app_context(),
-                             cvars::window_size_x, cvars::window_size_y);
-  if (!emulator_window_) {
+  if (cvars::no_window) {
+    cvars::headless = true;
+  } else {
+    emulator_window_ =
+        EmulatorWindow::Create(emulator_.get(), app_context(),
+                               cvars::window_size_x, cvars::window_size_y);
+  }
+  if (!emulator_window_ && !cvars::no_window) {
     XELOGE("Failed to create the main emulator window");
     return false;
   }
@@ -593,17 +640,28 @@ void EmulatorApp::EmulatorThread() {
 
   // Setup and initialize all subsystems. If we can't do something
   // (unsupported system, memory issues, etc) this will fail early.
-  X_STATUS result = emulator_->Setup(
-      emulator_window_->window(), emulator_window_->imgui_drawer(), true, true,
-      CreateAudioSystem, CreateGraphicsSystem, CreateInputDrivers);
+  // Without a window, a presenter is only made (offscreen) for snapshots.
+  X_STATUS result =
+      cvars::no_window
+          ? emulator_->Setup(nullptr, nullptr, true,
+                             !cvars::snapshot_vblanks.empty(),
+                             CreateAudioSystem, CreateGraphicsSystem,
+                             CreateInputDrivers)
+          : emulator_->Setup(emulator_window_->window(),
+                             emulator_window_->imgui_drawer(), true, true,
+                             CreateAudioSystem, CreateGraphicsSystem,
+                             CreateInputDrivers);
   if (XFAILED(result)) {
     XELOGE("Failed to setup emulator: {:08X}", result);
     app_context().RequestDeferredQuit();
     return;
   }
 
-  app_context().CallInUIThread(
-      [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
+  if (emulator_window_) {
+    app_context().CallInUIThread(
+        [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
+  }
+  SetupReduxVblankHook();
 
   const auto fs = emulator_->file_system();
 
@@ -718,20 +776,26 @@ void EmulatorApp::EmulatorThread() {
       discord::DiscordPresence::PlayingTitle(
           game_title.empty() ? "Unknown Title" : std::string(game_title));
     }
-    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
+    if (emulator_window_) {
+      app_context().CallInUIThread(
+          [this]() { emulator_window_->UpdateTitle(); });
+    }
     emulator_thread_event_->Set();
   });
 
-  emulator_->on_shader_storage_initialization.AddListener(
-      [this](bool initializing) {
-        app_context().CallInUIThread([this, initializing]() {
-          emulator_window_->SetInitializingShaderStorage(initializing);
+  if (emulator_window_) {
+    emulator_->on_shader_storage_initialization.AddListener(
+        [this](bool initializing) {
+          app_context().CallInUIThread([this, initializing]() {
+            emulator_window_->SetInitializingShaderStorage(initializing);
+          });
         });
-      });
 
-  emulator_->on_patch_apply.AddListener([this]() {
-    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
-  });
+    emulator_->on_patch_apply.AddListener([this]() {
+      app_context().CallInUIThread(
+          [this]() { emulator_window_->UpdateTitle(); });
+    });
+  }
 
   emulator_->on_terminate.AddListener([]() {
     if (cvars::discord) {
@@ -740,8 +804,10 @@ void EmulatorApp::EmulatorThread() {
   });
 
   // Enable emulator input now that the emulator is properly loaded.
-  app_context().CallInUIThread(
-      [this]() { emulator_window_->OnEmulatorInitialized(); });
+  if (emulator_window_) {
+    app_context().CallInUIThread(
+        [this]() { emulator_window_->OnEmulatorInitialized(); });
+  }
 
   // Grab path from the flag or unnamed argument.
   std::filesystem::path path;
@@ -753,8 +819,12 @@ void EmulatorApp::EmulatorThread() {
     // Normalize the path and make absolute.
     auto abs_path = std::filesystem::absolute(path);
 
-    result = app_context().CallInUIThread(
-        [this, abs_path]() { return emulator_window_->RunTitle(abs_path); });
+    if (emulator_window_) {
+      result = app_context().CallInUIThread(
+          [this, abs_path]() { return emulator_window_->RunTitle(abs_path); });
+    } else {
+      result = emulator_->LaunchPath(abs_path);
+    }
     if (XFAILED(result)) {
       xe::FatalError(fmt::format("Failed to launch target: {:08X}", result));
       app_context().RequestDeferredQuit();
@@ -768,7 +838,7 @@ void EmulatorApp::EmulatorThread() {
   if (xam) {
     xam->LoadLoaderData();
 
-    if (!xam->loader_data().host_path.empty()) {
+    if (!xam->loader_data().host_path.empty() && emulator_window_) {
       const std::filesystem::path host_path = xam->loader_data().host_path;
       app_context().CallInUIThread([this, host_path]() {
         return emulator_window_->RunTitle(host_path);
@@ -780,6 +850,67 @@ void EmulatorApp::EmulatorThread() {
   while (!emulator_thread_quit_requested_.load(std::memory_order_relaxed)) {
     xe::threading::Wait(emulator_thread_event_.get(), false);
     emulator_->WaitUntilExit();
+  }
+}
+
+void EmulatorApp::SetupReduxVblankHook() {
+  std::set<uint64_t> snapshots;
+  for (std::string_view part :
+       xe::utf8::split(cvars::snapshot_vblanks, ", ", true)) {
+    snapshots.insert(std::strtoull(std::string(part).c_str(), nullptr, 10));
+  }
+  const uint64_t exit_at = cvars::exit_after_vblanks;
+  redux::vblank_hook = [this, snapshots, exit_at](uint64_t vblank) {
+    if (vblank % 600 == 0) {
+      XELOGI("Redux: vblank {}", vblank);
+    }
+    // Snapshots still being written; the exit waits for them.
+    static std::atomic<int> pending_snapshots{0};
+    if (snapshots.count(vblank)) {
+      // Off the vblank thread: capturing waits for the GPU.
+      ++pending_snapshots;
+      std::thread([this, vblank]() {
+        SaveSnapshot(vblank);
+        --pending_snapshots;
+      }).detach();
+    }
+    if (exit_at && vblank >= exit_at) {
+      XELOGI("Redux: exiting at vblank {} (--exit_after_vblanks)", vblank);
+      for (int i = 0; i < 200 && pending_snapshots > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      if (redux::flush_hook) {
+        redux::flush_hook();
+      }
+      xe::FlushLog();
+      std::quick_exit(EXIT_SUCCESS);
+    }
+  };
+}
+
+void EmulatorApp::SaveSnapshot(uint64_t vblank) {
+  ui::Presenter* presenter = emulator_->graphics_system()->presenter();
+  ui::RawImage image;
+  if (!presenter || !presenter->CaptureGuestOutput(image)) {
+    XELOGE("Redux: no guest output to snapshot at vblank {}", vblank);
+    return;
+  }
+  std::filesystem::create_directories(cvars::snapshot_dir);
+  const std::filesystem::path path =
+      cvars::snapshot_dir / fmt::format("vblank_{:06}.png", vblank);
+  std::ofstream file(path, std::ios::binary);
+  const int written = stbi_write_png_to_func(
+      [](void* context, void* data, int size) {
+        reinterpret_cast<std::ofstream*>(context)->write(
+            reinterpret_cast<const char*>(data), size);
+      },
+      &file, int(image.width), int(image.height), 4, image.data.data(),
+      int(image.stride));
+  if (written) {
+    XELOGI("Redux: snapshot {}x{} at vblank {} -> {}", image.width,
+           image.height, vblank, path);
+  } else {
+    XELOGE("Redux: could not write {}", path);
   }
 }
 

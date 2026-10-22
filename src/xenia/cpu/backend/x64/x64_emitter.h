@@ -261,6 +261,9 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
+  // XeniaRedux call log: a tail call from a logged function (target null:
+  // call rax).
+  void CallLoggedTailCall(void* target);
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
   void CallNative(uint64_t (*fn)(void* raw_context));
@@ -410,6 +413,7 @@ class X64Emitter : public Xbyak::CodeGenerator {
   FunctionDebugInfo* debug_info_ = nullptr;
   uint32_t debug_info_flags_ = 0;
   FunctionTraceData* trace_data_ = nullptr;
+  bool call_logged_ = false;  // XeniaRedux call log covers this function
   Arena source_map_arena_;
 
   size_t stack_size_ = 0;

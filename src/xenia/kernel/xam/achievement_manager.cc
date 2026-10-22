@@ -8,6 +8,7 @@
  */
 
 #include "xenia/kernel/xam/achievement_manager.h"
+#include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/kernel/kernel_state.h"
@@ -146,6 +147,10 @@ void AchievementManager::ShowAchievementEarnedNotification(
                   xe::to_utf8(achievement->achievement_name));
 
   const Emulator* emulator = kernel_state()->emulator();
+  if (!emulator->display_window()) {
+    XELOGI("Achievement unlocked: {}", description);
+    return;
+  }
   ui::WindowedAppContext& app_context =
       emulator->display_window()->app_context();
   ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();

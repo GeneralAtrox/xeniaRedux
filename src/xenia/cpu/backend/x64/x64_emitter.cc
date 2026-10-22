@@ -29,6 +29,7 @@
 #include "xenia/cpu/backend/x64/x64_function.h"
 #include "xenia/cpu/backend/x64/x64_sequences.h"
 #include "xenia/cpu/backend/x64/x64_stack_layout.h"
+#include "xenia/cpu/call_log.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/function_debug_info.h"
@@ -119,6 +120,12 @@ bool X64Emitter::Emit(GuestFunction* function, HIRBuilder* builder,
   debug_info_ = debug_info;
   debug_info_flags_ = debug_info_flags;
   trace_data_ = &function->trace_data();
+  call_logged_ = call_log::IsLogged(function->address());
+  if (call_logged_) {
+    call_log::DescribeFunction(processor()->memory(), function->address(),
+                               function->end_address(),
+                               IsFeatureEnabled(kX64EmitFMA));
+  }
   source_map_arena_.Reset();
 
   // Fill the generator with code.
@@ -264,6 +271,12 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
     bts(qword[low_address(&trace_header->function_thread_use)], rax);
   }
 
+  // XeniaRedux call log: all guest registers are in the context here.
+  if (call_logged_) {
+    CallNative(&call_log::Entry, current_guest_function_);
+    ForgetMxcsrMode();
+  }
+
   // Load membase.
   /*
   * chrispy: removed this, as long as we load it in HostToGuestThunk we can
@@ -314,6 +327,11 @@ bool X64Emitter::Emit(HIRBuilder* builder, EmitFunctionInfo& func_info) {
   L(epilog_label);
   epilog_label_ = nullptr;
   EmitTraceUserCallReturn();
+  if (call_logged_) {
+    // Every return of a logged function comes here (tail calls are made
+    // ordinary calls below), with the guest registers in the context.
+    CallNative(&call_log::Exit, current_guest_function_);
+  }
   /*
   * chrispy: removed this, it serves no purpose
   mov(GetContextReg(), qword[rsp + StackLayout::GUEST_CTX_HOME]);
@@ -387,9 +405,14 @@ void X64Emitter::MarkSourceOffset(const Instr* i) {
   if (debug_info_flags_ & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) {
     uint32_t instruction_index =
         (entry->guest_address - trace_data_->start_address()) / 4;
+    // Keep the host flags: a guest compare and the branch that reads it can
+    // be fused across this instruction boundary (XeniaRedux fix; without it
+    // e.g. bnectr branches on the counter's flags).
+    pushfq();
     lock();
     inc(qword[low_address(trace_data_->instruction_execute_counts() +
                           instruction_index * 8)]);
+    popfq();
   }
 }
 
@@ -693,6 +716,8 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
 
       call((void*)fn->machine_code());
       synchronize_stack_on_next_instruction_ = true;
+    } else if (call_logged_) {
+      CallLoggedTailCall((void*)fn->machine_code());
     } else {
       // tail call
       EmitTraceUserCallReturn();
@@ -720,7 +745,9 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   }
 
   // Actually jump/call to rax.
-  if (instr->flags & hir::CALL_TAIL) {
+  if ((instr->flags & hir::CALL_TAIL) && call_logged_) {
+    CallLoggedTailCall(nullptr);
+  } else if (instr->flags & hir::CALL_TAIL) {
     // Since we skip the prolog we need to mark the return here.
     EmitTraceUserCallReturn();
     EmitProfilerEpilogue();
@@ -737,6 +764,21 @@ void X64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
     call(rax);
     synchronize_stack_on_next_instruction_ = true;
   }
+}
+
+void X64Emitter::CallLoggedTailCall(void* target) {
+  // A logged function must reach its epilog to log its exit, so its tail
+  // calls become calls followed by a return. The callee still gets this
+  // function's return address, as a tail call would pass it.
+  mov(rcx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
+  if (target) {
+    call(target);
+  } else {
+    call(rax);
+  }
+  EnsureSynchronizedGuestAndHostStack();
+  ForgetMxcsrMode();
+  jmp(epilog_label(), T_NEAR);
 }
 
 void X64Emitter::CallIndirect(const hir::Instr* instr,
@@ -766,7 +808,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
   }
 
   // Actually jump/call to rax.
-  if (instr->flags & hir::CALL_TAIL) {
+  if ((instr->flags & hir::CALL_TAIL) && call_logged_) {
+    CallLoggedTailCall(nullptr);
+  } else if (instr->flags & hir::CALL_TAIL) {
     // Since we skip the prolog we need to mark the return here.
     EmitTraceUserCallReturn();
     EmitProfilerEpilogue();

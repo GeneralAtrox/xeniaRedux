@@ -23,6 +23,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/breakpoint.h"
+#include "xenia/cpu/call_log.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/cpu/module.h"
@@ -156,6 +157,10 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
   if (!functions_trace_path_.empty()) {
     functions_trace_file_ =
         ChunkedMappedMemoryWriter::Open(functions_trace_path_, 32_MiB, true);
+  }
+
+  if (!call_log::Initialize()) {
+    return false;
   }
 
   return true;

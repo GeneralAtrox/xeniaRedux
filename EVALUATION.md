@@ -51,6 +51,7 @@ limit, and a forced stop at the end. Snapshots were taken of Xenia's own window.
 | 3 | 146 s | Like run 1, but at 145 s it was at a **different shot** of the cutscene than run 1 was. |
 | 4 | 543 s | Opening cutscene through to the "A Silicon Knights Game" credit at 300 s. At about 360 s the window was maximised, then minimised, and the title bar showed the game clock at 4096× speed (12 "double speed" steps). My script did none of that, so everything after 300 s is set aside. |
 
+- (Update: the replayed input in §8 now reaches the title screen and play.)
 - **Title screen: not reached.** Nothing appeared in 300 s of unattended play. The opening cutscene needs a button
   press to skip, and Xenia cannot play back recorded button presses (see the table below).
 - **Gameplay: not reached**, for the same reason. The cutscene is real-time, in-engine rendering, so the game's own
@@ -206,6 +207,101 @@ elevator softlock could appear or vanish).
 for a multi-threaded game needs a decision on what counts as the same order of events, on both sides. That choice
 shapes R9, so it is worth settling first.
 
+## 8. The recorder hooks (branch `redux-recorder`)
+
+Four of the small hooks from §4 and §7 are now built: R1, R4, R5 and the register half of R2. Together they make a
+per-function recorder. Everything is still local: nothing was pushed, and the BSD licence is kept.
+
+### What was added
+
+| Hook | Switch | What it does |
+|---|---|---|
+| **Input replay** (R5) | `--replay_input="START@2600,A@5100+10"` | Presses buttons on controller 1 from a list, using DP's syntax: button `@` vblank, with an optional `+` length (default 10 vblanks). `@file` reads the list from a file. Buttons: `A B X Y START BACK LB RB LS RS GUIDE UP DOWN LEFT RIGHT`, the triggers `LT RT`, and full stick pushes `LUP LDOWN LLEFT LRIGHT RUP RDOWN RLEFT RRIGHT`. Every change is written to the log. |
+| **No window** (R1) | `--no_window=true` | Runs with no window. A hidden screen is made only when snapshots are asked for. Dialogs answer themselves, as with `--headless`. |
+| **Snapshots and timed exit** | `--snapshot_vblanks=8760,9300`, `--snapshot_dir=…`, `--exit_after_vblanks=9400` | Saves what the game shows as a PNG at those vblanks. At the exit vblank it waits for the snapshots, saves the logs and quits by itself, so nothing is lost to a forced stop. |
+| **Call log** (R2, registers only) | `--call_log_functions=82338a88,…` (or `@file`), `--call_log_path=calllog.bin`, `--call_log_max_mb=450`, `--call_log_per_function_limit=20000` | For each listed function, writes one record when it starts and one when it returns, in the order they happened across all threads. Each record has the thread, a sequence number, the vblank, LR, r1, r3–r10 and f1–f13. At the return, r3 and f1 hold the results. The JIT adds this to the function's code, the same way as the existing `--trace_functions` counters. It writes to disk as it goes, stops at the size cap (450 MB by default, with a "truncated" marker), and keeps at most 20,000 calls per function. |
+| **Trust marks** | (automatic, in the call log) | When Xenia compiles a listed function, it checks the instructions for the risks in §5a and stores them in the log: estimate instructions, fused multiply-add (and whether this PC fuses it), `stfs`, `fctiw` and traps. |
+| **Coverage export** (R4) | `tools/redux/coverage_to_dp.py` | Turns `--trace_function_coverage` output into DP's `coverage.txt` (the start address of every block that ran). It reads DP's `decomp/image.bin` to find where blocks end. |
+
+Two small readers sit in `tools/redux/`:
+
+- `calllog_read.py summary|dump|pairs|trust LOG` lists the calls, prints records, writes matched start/return pairs
+  as JSON lines, or writes the trust list.
+- `coverage_to_dp.py TRACE.bin --image image.bin -o coverage.txt` does the coverage export.
+
+`eval/redux_run.ps1` runs Too Human with all of this. Every run has a time limit, sound off, a RAM check every 3 s
+(stopping at 95%), and the whole process tree stopped at the end.
+
+**Trust levels.** DP's judge, not Xenia, decides any disagreement inside a function marked "not trusted".
+
+| Level | When | Why |
+|---|---|---|
+| not-trusted | estimate instructions (`fres`, `frsqrte`, `vrefp`, `vrsqrtefp`, `vexptefp`, `vlogefp`) or fused multiply-add (`fmadd` family, `vmaddfp`, `vnmsubfp`) | Xenia gives exact values where the chip gives estimates; fused or not depends on this PC (§5a) |
+| caution | `stfs`, `fctiw`/`fctiwz`, traps | Xenia rounds where the chip selects bits; compare only the low word; traps are ignored |
+| trusted | none of these | |
+
+### Too Human results
+
+**The cutscenes are skipped, and the game reaches play, with no one at the controls.** The final run (`final2`) used
+`START@2600,START@4500,A@5100,A@5700,A@6300,A@6900,B@8100,B@8400,B@8700,B@9000,LUP@9600+400`, with no window and
+the call log on. It took 179 s, and RAM peaked at 87.6%. The snapshots are in `eval/redux_final2_snapshots.png`.
+
+| Vblank | Press | What the snapshots and log show |
+|---|---|---|
+| 2600 | START | **Skips the opening cutscene.** The screen goes black, and the title screen is up by 4200. In a run with no input, the cutscene was still playing at 2400 and 3600. |
+| 4500 | START | Main menu |
+| 5100–6900 | A ×4 | Start Campaign, "proceed without saving", class choice (Champion), confirm |
+| 8100 | B | **Skips the level's airship intro.** The game asks for the level file (`world01.zzz`) on the very next log line, and the loading screen is up by 8160. In a run without B, the intro was still playing at 9400. START or A does not skip it. B only works once the intro has finished loading, so the later B presses are spares; in play they did nothing visible. |
+| 8460–9600 | | **Play.** Baldur stands in the level's first room, idle. |
+| 9600–10000 | left stick up | **Baldur walks** out of the doorway into the courtyard (snapshots 9800, 10000, 10200), so the game is taking the replayed stick. |
+
+**The call log was written and read back.** Seven functions were logged, chosen to cover each trust level:
+
+| Function | Calls logged | Trust | Why |
+|---|---|---|---|
+| `82338a88` | 20,000 (cap) | trusted | plain integer code |
+| `82807828` | 100 | trusted | ends with a tail call into a register-restore helper; the return is still logged |
+| `82c45138` | 2,268 | trusted | two instructions (`lwz r3,0xe4(r3); blr`): a getter |
+| `82817e08` | 20,000 (cap) | not trusted | 8 fused multiply-adds, 3 `fctiw` |
+| `8281dd38` | 20,000 (cap) | not trusted | 2 fused multiply-adds, 3 `stfs` |
+| `8296fea8` | 8,307 | not trusted | 2 estimate instructions, 6 fused multiply-adds |
+| `829a6838` | 14,708 | not trusted | 6 estimates, 24 fused multiply-adds, 14 `stfs` |
+
+- The log is 37 MB, 170,766 records from vblank 88 to 10,200, and was not cut short. This PC has FMA, so Xenia fused
+  every multiply-add.
+- **Every start has its matching return** (85,383 pairs). The stack pointer (r1), the return address (LR) and the
+  thread are the same at both ends of every pair, as they must be.
+- The getter's logged calls fit its code: its only input is r3 (a pointer), and only r3 changes at the return. The
+  value it loads from memory cannot be checked yet, because memory is not logged (see Limits).
+- The trust list is `eval/redux_final2_trust.txt`, one line per function. `calllog_read.py pairs` writes each call
+  as a JSON line with an `"xenia"` field that carries the same level, so DP can tell which disagreements Xenia
+  cannot settle.
+
+**Coverage export.** A coverage run through the opening (`cov1`, 4,300 vblanks) gave 42,846 compiled functions and
+1,087,918 instructions run. That made 182,088 block starts in DP's `coverage.txt` format. Spot checks of
+instructions that never ran showed real branch skips, not gaps in the data.
+
+### Bug fixed on the way
+
+With `--trace_function_coverage` on, Too Human crashed at the start (a jump to address 0 at `82EC5470`). Upstream
+Xenia's coverage counter (`lock inc`) changes the CPU's condition flags. The JIT had already compared, and it
+branched on those changed flags. The counter now saves and restores the flags (`pushfq`/`popfq`). With that, the
+coverage run went through the menus without a crash.
+
+### Limits
+
+- **Registers only.** The call log does not yet record vector registers, or the memory words a function reads and
+  writes. §6's referee step needs those memory words. They are the next piece of R2.
+- **x64 only.** The ARM64 JIT is not hooked.
+- **Still not repeatable.** Vblanks come from a PC timer (41 to 57 per second on this machine, depending on load,
+  not 60), so the same button list can land at slightly different moments in two runs. The menu timings held in
+  every run that used them. The level intro, though, finished loading at different vblanks in different runs, which
+  is why B is pressed several times. Whole runs still differ (§2).
+- **Caps.** 20,000 calls per function, and 450 MB per log by default. Very busy functions fill their 20,000 in the
+  first seconds, so the log shows the early calls. Pick the moment with `--exit_after_vblanks` and the per-function
+  limit.
+- **Controller 1 only.** The replay drives one controller, and it reads no real input while it runs.
+
 ## Reproduce
 
 ```
@@ -217,3 +313,17 @@ pwsh -File eval\boot_run.ps1 -Seconds 150 -Tag run1
 
 `boot_run.ps1` writes its log and snapshots next to itself. `portable.txt` in the exe's folder keeps Xenia's config
 and content there.
+
+The recorder run from §8 (about 4 minutes):
+
+```
+pwsh -File eval\redux_run.ps1 -Seconds 500 -Tag final2 -NoWindow -ExitAfter 10200 `
+  -Buttons "START@2600,START@4500,A@5100,A@5700,A@6300,A@6900,B@8100,B@8400,B@8700,B@9000,LUP@9600+400" `
+  -Functions "8296fea8,829a6838,8281dd38,82817e08,82338a88,82807828,82c45138" `
+  -Snapshots "2500,2800,4200,7700,8160,8460,8760,9060,9360,9600,9800,10000,10200"
+python tools\redux\calllog_read.py summary eval\final2\calllog.bin
+python tools\redux\calllog_read.py trust eval\final2\calllog.bin -o eval\final2\trust.txt
+```
+
+A coverage run adds `-Coverage`. Its output then goes to DP's format with
+`python tools\redux\coverage_to_dp.py eval\<Tag>\trace.bin --image C:\Projects\TooHuman\decomp\image.bin -o coverage.txt`.
