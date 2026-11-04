@@ -9,11 +9,14 @@ param(
   [int]$ExitAfter = 0,            # vblank at which Xenia flushes and exits by itself
   [switch]$NoWindow,
   [switch]$Coverage,
-  [string[]]$Extra = @()
+  [string[]]$Extra = @(),
+  [string]$Exe = 'C:\Projects\XeniaRedux\build\bin\Windows\Release\xenia_canary.exe',   # another machine's copy, e.g. MAGNUS's
+  [string]$Iso = 'C:\Projects\TooHuman\Too Human (Japan, Europe)\Too Human (Japan, Europe).iso',
+  [string]$OutRoot = $PSScriptRoot  # where <Tag>\ goes
 )
-$exe = 'C:\Projects\XeniaRedux\build\bin\Windows\Release\xenia_canary.exe'
-$iso = 'C:\Projects\TooHuman\Too Human (Japan, Europe)\Too Human (Japan, Europe).iso'
-$out = Join-Path $PSScriptRoot $Tag
+$exe = $Exe
+$iso = $Iso
+$out = Join-Path $OutRoot $Tag
 New-Item -ItemType Directory -Force $out | Out-Null
 function Ram { $o = Get-CimInstance Win32_OperatingSystem; [math]::Round((1 - $o.FreePhysicalMemory / $o.TotalVisibleMemorySize) * 100, 1) }
 $a = @("--log_file=`"$out\xenia.log`"", '--apu=nop', '--headless=true', '--discord=false')
